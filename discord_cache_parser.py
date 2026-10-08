@@ -77,11 +77,11 @@ _SIMPLE_FILE_PATTERN = re.compile(r"^[0-9a-f]{16}_0$")
 _OKHTTP_FILE_PATTERN = re.compile(r"^[0-9a-f]{16}\.[01]$")
 
 
-def load_chromium_cache_class_guesser():
+def load_chromium_cache_module():
     try:
-        from ccl_chromium_reader.ccl_chromium_cache import guess_cache_class
+        from ccl_chromium_reader import ccl_chromium_cache
 
-        return guess_cache_class
+        return ccl_chromium_cache
     except ModuleNotFoundError:
         module_path_candidates = []
         current_dir = pathlib.Path(__file__).resolve().parent
@@ -99,11 +99,71 @@ def load_chromium_cache_class_guesser():
                 continue
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            return getattr(module, "guess_cache_class", None)
+            return module
         return None
 
 
-chromium_cache_class_guesser = load_chromium_cache_class_guesser()
+def warn(message: str) -> None:
+    print(f"Warning: {message}", file=sys.stderr)
+
+
+def make_blockfile_cache_class(module):
+    """ccl_chromium_reader's ChromiumBlockFileCache with a fault-tolerant _build_keys.
+
+    Upstream decodes a whole long-key block as UTF-8 and only then cuts it to key_length, so slack
+    bytes after the key (left over from earlier entries) raise UnicodeDecodeError and abort the
+    whole cache. Here the bytes are cut first; a key that still won't decode keeps U+FFFD in place
+    of the bad bytes. Entries whose key can't be read at all are skipped with a warning.
+    """
+    if module is None or not hasattr(module, "ChromiumBlockFileCache"):
+        return None
+    entry_store = module.EntryStore
+
+    class TolerantBlockFileCache(module.ChromiumBlockFileCache):
+        def _build_keys(self):
+            result = {}
+            seen = set()
+            for addr in self._index_file.index:
+                while addr.is_initialized:
+                    if not addr.sanity_check_for_entry():
+                        warn(f"address skipped, not sane for an entry: {addr}")
+                        break
+                    addr_id = (addr.file_type, addr.file_selector, addr.block_number)
+                    if addr_id in seen:
+                        warn(f"entry chain loops back to {addr}, stopping this chain")
+                        break
+                    seen.add(addr_id)
+                    try:
+                        es = entry_store.from_bytes(self.get_data_for_addr(addr))
+                    except (ValueError, OverflowError, OSError, TypeError) as exc:
+                        warn(f"entry at {addr} could not be read ({exc}), rest of this chain skipped")
+                        break
+                    key = es.key
+                    if key is None:
+                        try:
+                            raw_key = self.get_data_for_addr(es.long_key_addr)
+                        except (ValueError, OSError) as exc:
+                            raw_key = None
+                            warn(f"long key at {es.long_key_addr} could not be read ({exc})")
+                        if raw_key is None:
+                            addr = es.next_entry
+                            continue
+                        raw_key = raw_key[: es.key_length]
+                        try:
+                            key = raw_key.decode("utf-8")
+                        except UnicodeDecodeError:
+                            key = raw_key.decode("utf-8", errors="replace")
+                            warn(f"long key at {es.long_key_addr} is not valid UTF-8, kept with U+FFFD: {key!r}")
+                    result[key] = es
+                    addr = es.next_entry
+            return result
+
+    return TolerantBlockFileCache
+
+
+chromium_cache_module = load_chromium_cache_module()
+chromium_cache_class_guesser = getattr(chromium_cache_module, "guess_cache_class", None)
+blockfile_cache_class = make_blockfile_cache_class(chromium_cache_module)
 
 
 class BinaryReader:
@@ -643,66 +703,76 @@ def process_blockfile_cache(
     deduplicated_messages: set[str] = set()
     avatars: dict[str, list[CachedAvatar]] = defaultdict(list)
     attachments: dict[str, list[CachedAttachment]] = defaultdict(list)
+    skipped = 0
     cache_type = chromium_cache_class_guesser(cache_dir)
     if cache_type is None:
         raise ValueError(f"Could not detect Chromium cache type in {cache_dir}")
+    if cache_type is chromium_cache_module.ChromiumBlockFileCache and blockfile_cache_class is not None:
+        cache_type = blockfile_cache_class
 
     with cache_type(cache_dir) as cache:
         for cache_key in cache.cache_keys():
-            parsed_url = urllib.parse.urlparse(cache_key.url)
-            metas = cache.get_metadata(cache_key)
-            datas = cache.get_cachefile(cache_key)
+            try:
+                parsed_url = urllib.parse.urlparse(cache_key.url)
+                metas = cache.get_metadata(cache_key)
+                datas = cache.get_cachefile(cache_key)
 
-            if parsed_url.path.endswith("/messages"):
-                for meta, data in zip(metas, datas):
-                    if not data:
-                        continue
-                    encoding = (meta.get_attribute("content-encoding") or [""])[0] if meta else ""
-                    inflated = inflate_bytes(data, encoding)
-                    payload = json.loads(inflated)
-                    if isinstance(payload, list):
-                        for message in payload:
-                            deduplicated_messages.add(json.dumps(message, sort_keys=True))
-                continue
-
-            if parsed_url.path.startswith("/avatars/") and "discord" in parsed_url.netloc:
-                parts = parsed_url.path.split("/")
-                if len(parts) < 4:
+                if parsed_url.path.endswith("/messages"):
+                    for meta, data in zip(metas, datas):
+                        if not data:
+                            continue
+                        encoding = (meta.get_attribute("content-encoding") or [""])[0] if meta else ""
+                        inflated = inflate_bytes(data, encoding)
+                        payload = json.loads(inflated)
+                        if isinstance(payload, list):
+                            for message in payload:
+                                deduplicated_messages.add(json.dumps(message, sort_keys=True))
                     continue
-                avatar_id = parts[2]
-                avatar_name = parts[3]
-                files = []
-                for meta, data in zip(metas, datas):
-                    if not data:
-                        continue
-                    encoding = (meta.get_attribute("content-encoding") or [""])[0] if meta else ""
-                    inflated = inflate_bytes(data, encoding)
-                    digest = hashlib.sha256(inflated).hexdigest()
-                    files.append(write_blob(output_dir, "avatars", digest, avatar_name, inflated))
-                if files:
-                    avatar_key = pathlib.Path(avatar_name).stem
-                    avatars[avatar_key].append(CachedAvatar(avatar_key, avatar_id, avatar_name, dedupe_files(files)))
-                continue
 
-            if parsed_url.path.startswith("/attachments/") and "discord" in parsed_url.netloc:
-                parts = parsed_url.path.split("/")
-                if len(parts) < 5:
-                    continue
-                channel_id = parts[2]
-                attachment_id = parts[3]
-                original_name = parts[4]
-                files = []
-                for meta, data in zip(metas, datas):
-                    if not data:
+                if parsed_url.path.startswith("/avatars/") and "discord" in parsed_url.netloc:
+                    parts = parsed_url.path.split("/")
+                    if len(parts) < 4:
                         continue
-                    encoding = (meta.get_attribute("content-encoding") or [""])[0] if meta else ""
-                    inflated = inflate_bytes(data, encoding)
-                    digest = hashlib.sha256(inflated).hexdigest()
-                    files.append(write_blob(output_dir, "attachments", digest, original_name, inflated))
-                if files:
-                    attachments[attachment_id].append(
-                        CachedAttachment(attachment_id, channel_id, original_name, dedupe_files(files))
-                    )
+                    avatar_id = parts[2]
+                    avatar_name = parts[3]
+                    files = []
+                    for meta, data in zip(metas, datas):
+                        if not data:
+                            continue
+                        encoding = (meta.get_attribute("content-encoding") or [""])[0] if meta else ""
+                        inflated = inflate_bytes(data, encoding)
+                        digest = hashlib.sha256(inflated).hexdigest()
+                        files.append(write_blob(output_dir, "avatars", digest, avatar_name, inflated))
+                    if files:
+                        avatar_key = pathlib.Path(avatar_name).stem
+                        avatars[avatar_key].append(CachedAvatar(avatar_key, avatar_id, avatar_name, dedupe_files(files)))
+                    continue
+
+                if parsed_url.path.startswith("/attachments/") and "discord" in parsed_url.netloc:
+                    parts = parsed_url.path.split("/")
+                    if len(parts) < 5:
+                        continue
+                    channel_id = parts[2]
+                    attachment_id = parts[3]
+                    original_name = parts[4]
+                    files = []
+                    for meta, data in zip(metas, datas):
+                        if not data:
+                            continue
+                        encoding = (meta.get_attribute("content-encoding") or [""])[0] if meta else ""
+                        inflated = inflate_bytes(data, encoding)
+                        digest = hashlib.sha256(inflated).hexdigest()
+                        files.append(write_blob(output_dir, "attachments", digest, original_name, inflated))
+                    if files:
+                        attachments[attachment_id].append(
+                            CachedAttachment(attachment_id, channel_id, original_name, dedupe_files(files))
+                        )
+            except Exception as exc:  # one bad entry must not end the run
+                skipped += 1
+                warn(f"entry {cache_key.raw_key!r} skipped: {type(exc).__name__}: {exc}")
+
+    if skipped:
+        warn(f"{skipped} blockfile cache entr{'y' if skipped == 1 else 'ies'} skipped, see warnings above")
 
     return deduplicated_messages, avatars, attachments
 
