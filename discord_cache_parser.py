@@ -6,21 +6,22 @@ import datetime as dt
 import gzip
 import hashlib
 import html
-import importlib.util
-import io
 import json
 import mimetypes
-import os
 import pathlib
 import re
-import struct
-import sys
-import types
 import typing
 import urllib.parse
 import zlib
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+
+from ccl_chromium_reader.ccl_chromium_cache import (
+    ChromiumBlockFileCache,
+    ChromiumCache,
+    ChromiumSimpleFileCache,
+    guess_cache_class,
+)
 
 try:
     import brotli
@@ -71,309 +72,12 @@ MSG_TYPES = {
 }
 
 
-_CHROME_EPOCH = dt.datetime(1601, 1, 1)
-_SIMPLE_EOF_SIZE = 24
-_SIMPLE_FILE_PATTERN = re.compile(r"^[0-9a-f]{16}_0$")
 _OKHTTP_FILE_PATTERN = re.compile(r"^[0-9a-f]{16}\.[01]$")
 
-
-def load_chromium_cache_class_guesser():
-    try:
-        from ccl_chromium_reader.ccl_chromium_cache import guess_cache_class
-
-        return guess_cache_class
-    except ModuleNotFoundError:
-        module_path_candidates = []
-        current_dir = pathlib.Path(__file__).resolve().parent
-        module_path_candidates.append(
-            current_dir / "vendor" / "ccl_chromium_reader" / "ccl_chromium_reader" / "ccl_chromium_cache.py"
-        )
-        for path_entry in map(pathlib.Path, sys.path):
-            module_path_candidates.append(path_entry / "ccl_chromium_reader" / "ccl_chromium_cache.py")
-
-        for module_path in module_path_candidates:
-            if not module_path.exists():
-                continue
-            spec = importlib.util.spec_from_file_location("embedded_chromium_cache", module_path)
-            if spec is None or spec.loader is None:
-                continue
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return getattr(module, "guess_cache_class", None)
-        return None
-
-
-chromium_cache_class_guesser = load_chromium_cache_class_guesser()
-
-
-class BinaryReader:
-    def __init__(self, stream: typing.BinaryIO):
-        self._stream = stream
-
-    @classmethod
-    def from_bytes(cls, buffer: bytes) -> "BinaryReader":
-        return cls(io.BytesIO(buffer))
-
-    def close(self) -> None:
-        self._stream.close()
-
-    def tell(self) -> int:
-        return self._stream.tell()
-
-    def seek(self, offset: int, whence: int) -> int:
-        return self._stream.seek(offset, whence)
-
-    def read_raw(self, count: int) -> bytes:
-        data = self._stream.read(count)
-        if len(data) != count:
-            raise ValueError(f"Unable to read {count} byte(s)")
-        return data
-
-    def read_uint16(self) -> int:
-        return struct.unpack("<H", self.read_raw(2))[0]
-
-    def read_uint32(self) -> int:
-        return struct.unpack("<I", self.read_raw(4))[0]
-
-    def read_uint64(self) -> int:
-        return struct.unpack("<Q", self.read_raw(8))[0]
-
-    def read_int32(self) -> int:
-        return struct.unpack("<i", self.read_raw(4))[0]
-
-    def read_datetime(self) -> dt.datetime:
-        return _CHROME_EPOCH + dt.timedelta(microseconds=self.read_uint64())
-
-    @property
-    def is_eof(self) -> bool:
-        marker = self._stream.read(1)
-        if not marker:
-            return True
-        self._stream.seek(-1, os.SEEK_CUR)
-        return False
-
-    def __enter__(self) -> "BinaryReader":
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()
-
-
-class CachedMetadata:
-    def __init__(
-        self,
-        header_declarations: set[str],
-        header_attributes: dict[str, list[str]],
-        request_time: dt.datetime,
-        response_time: dt.datetime,
-    ):
-        self._declarations = header_declarations.copy()
-        self._attributes = types.MappingProxyType(header_attributes.copy())
-        self._request_time = request_time
-        self._response_time = response_time
-
-    @property
-    def request_time(self) -> dt.datetime:
-        return self._request_time
-
-    @property
-    def response_time(self) -> dt.datetime:
-        return self._response_time
-
-    def get_attribute(self, attribute: str) -> list[str]:
-        return self._attributes.get(attribute.lower()) or []
-
-    @classmethod
-    def from_buffer(cls, buffer: bytes) -> "CachedMetadata":
-        reader = BinaryReader.from_bytes(buffer)
-        total_length = reader.read_uint32()
-        if total_length != len(buffer) - 4:
-            raise ValueError("Metadata buffer size mismatch")
-
-        def align() -> None:
-            alignment = reader.tell() % 4
-            if alignment:
-                reader.read_raw(4 - alignment)
-
-        flags = reader.read_uint32()
-        has_extra_flags = bool(flags & (1 << 31))
-        extra_flags = reader.read_uint32() if has_extra_flags else 0
-
-        request_time = reader.read_datetime()
-        response_time = reader.read_datetime()
-
-        if extra_flags & (1 << 2):
-            _ = reader.read_datetime()
-
-        http_header_length = reader.read_uint32()
-        http_header_raw = reader.read_raw(http_header_length)
-
-        header_attributes: dict[str, list[str]] = {}
-        header_declarations = set()
-        for header_entry in http_header_raw.split(b"\x00"):
-            if not header_entry:
-                continue
-            parsed_entry = header_entry.decode("latin-1").split(":", 1)
-            if len(parsed_entry) == 1:
-                header_declarations.add(parsed_entry[0])
-            else:
-                key = parsed_entry[0].lower()
-                header_attributes.setdefault(key, []).append(parsed_entry[1].strip())
-
-        if flags & (1 << 8):
-            align()
-            cert_count = reader.read_uint32()
-            for _ in range(cert_count):
-                align()
-                cert_length = reader.read_uint32()
-                reader.read_raw(cert_length)
-
-        if flags & (1 << 10):
-            align()
-            reader.read_uint32()
-
-        if flags & (1 << 9):
-            align()
-            reader.read_int32()
-
-        if flags & (1 << 16):
-            align()
-            reader.read_int32()
-
-        return cls(header_declarations, header_attributes, request_time, response_time)
-
-
-class SimpleCacheEOF:
-    MAGIC = 0xF4FA6F45970D41D8
-
-    def __init__(self, flags: int, data_crc: int, stream_size: int):
-        self.flags = flags
-        self.data_crc = data_crc
-        self.stream_size = stream_size
-
-    @classmethod
-    def from_reader(cls, reader: BinaryReader) -> "SimpleCacheEOF":
-        magic = reader.read_uint64()
-        if magic != cls.MAGIC:
-            raise ValueError("Invalid simple cache EOF marker")
-        flags = reader.read_uint32()
-        data_crc = reader.read_uint32()
-        stream_size = reader.read_uint32()
-        return cls(flags, data_crc, stream_size)
-
-    @property
-    def has_key_sha256(self) -> bool:
-        return bool(self.flags & 2)
-
-
-class SimpleCacheHeader:
-    MAGIC = 0xFCFB6D1BA7725C30
-
-    def __init__(self, version: int, key_length: int, key_hash: int):
-        self.version = version
-        self.key_length = key_length
-        self.key_hash = key_hash
-
-    @classmethod
-    def from_reader(cls, reader: BinaryReader) -> "SimpleCacheHeader":
-        magic = reader.read_uint64()
-        if magic != cls.MAGIC:
-            raise ValueError("Invalid simple cache header")
-        version = reader.read_uint32()
-        key_length = reader.read_uint32()
-        key_hash = reader.read_uint32()
-        reader.read_uint32()
-        return cls(version, key_length, key_hash)
-
-
-class SimpleCacheFile:
-    def __init__(self, cache_file: pathlib.Path):
-        self.path = cache_file
-        self._reader = BinaryReader(cache_file.open("rb"))
-        self._header = SimpleCacheHeader.from_reader(self._reader)
-        self.key = self._reader.read_raw(self._header.key_length).decode("latin-1")
-
-        if self._reader.is_eof:
-            self._has_data = False
-            self._stream_0_eof = None
-            self._stream_1_start_offset = 0
-            self._stream_1_length = 0
-            self._stream_0_start_offset_negative = 0
-            return
-
-        self._has_data = True
-        self._reader.seek(-_SIMPLE_EOF_SIZE, os.SEEK_END)
-        self._stream_0_eof = SimpleCacheEOF.from_reader(self._reader)
-        self._stream_0_start_offset_negative = -_SIMPLE_EOF_SIZE - self._stream_0_eof.stream_size
-        if self._stream_0_eof.has_key_sha256:
-            self._stream_0_start_offset_negative -= 32
-
-        self._reader.seek(-(_SIMPLE_EOF_SIZE * 2) - self._stream_0_eof.stream_size, os.SEEK_END)
-        if self._stream_0_eof.has_key_sha256:
-            self._reader.seek(-32, os.SEEK_CUR)
-        stream_1_end_offset = self._reader.tell()
-        _ = SimpleCacheEOF.from_reader(self._reader)
-        self._stream_1_start_offset = _SIMPLE_EOF_SIZE + self._header.key_length
-        self._stream_1_length = stream_1_end_offset - self._stream_1_start_offset
-
-    def get_stream_0(self) -> bytes:
-        if not self._has_data:
-            return b""
-        self._reader.seek(self._stream_0_start_offset_negative, os.SEEK_END)
-        return self._reader.read_raw(self._stream_0_eof.stream_size)
-
-    def get_stream_1(self) -> bytes:
-        if not self._has_data:
-            return b""
-        self._reader.seek(self._stream_1_start_offset, os.SEEK_SET)
-        return self._reader.read_raw(self._stream_1_length)
-
-    def close(self) -> None:
-        self._reader.close()
-
-    def __enter__(self) -> "SimpleCacheFile":
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()
-
-
-class ChromiumSimpleFileCache:
-    def __init__(self, cache_dir: pathlib.Path):
-        self.cache_dir = cache_dir
-        self._file_lookup = self._build_keys()
-
-    def _build_keys(self) -> dict[str, list[pathlib.Path]]:
-        lookup: dict[str, list[pathlib.Path]] = {}
-        for cache_file in self.cache_dir.iterdir():
-            if cache_file.is_file() and _SIMPLE_FILE_PATTERN.match(cache_file.name):
-                with SimpleCacheFile(cache_file) as cache_entry:
-                    lookup.setdefault(cache_entry.key, []).append(cache_file)
-        return lookup
-
-    def cache_keys(self) -> typing.Iterable[str]:
-        yield from self._file_lookup.keys()
-
-    def get_metadata(self, key: str) -> list[CachedMetadata | None]:
-        results = []
-        for file in self._file_lookup[key]:
-            with SimpleCacheFile(file) as cache_entry:
-                buffer = cache_entry.get_stream_0()
-                results.append(CachedMetadata.from_buffer(buffer) if buffer else None)
-        return results
-
-    def get_cachefile(self, key: str) -> list[bytes]:
-        results = []
-        for file in self._file_lookup[key]:
-            with SimpleCacheFile(file) as cache_entry:
-                results.append(cache_entry.get_stream_1())
-        return results
-
-    def __enter__(self) -> "ChromiumSimpleFileCache":
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        return None
+_CACHE_TYPE_NAMES = {
+    ChromiumSimpleFileCache: "chromium-simple",
+    ChromiumBlockFileCache: "chromium-block",
+}
 
 
 @dataclass(frozen=True)
@@ -483,15 +187,9 @@ def yield_okhttp_objects(cache_dir: pathlib.Path) -> typing.Iterable[tuple[str, 
         yield url, meta, content_file
 
 
-def detect_cache_type(cache_dir: pathlib.Path) -> str:
+def is_okhttp_cache(cache_dir: pathlib.Path) -> bool:
     names = {child.name for child in cache_dir.iterdir()}
-    if "journal" in names or any(_OKHTTP_FILE_PATTERN.match(name) for name in names):
-        return "okhttp"
-    if "index-dir" in names or any(_SIMPLE_FILE_PATTERN.match(name) for name in names):
-        return "chromium-simple"
-    if "data_0" in names or any(name.startswith("f_") for name in names):
-        return "chromium-block"
-    return "unknown"
+    return "journal" in names or any(_OKHTTP_FILE_PATTERN.match(name) for name in names)
 
 
 def ensure_empty_output_dir(output_dir: pathlib.Path) -> None:
@@ -517,74 +215,6 @@ def dedupe_files(files: list[AttachmentFile]) -> list[AttachmentFile]:
     for file_ref in files:
         unique[file_ref.sha256] = file_ref
     return list(unique.values())
-
-
-def process_chromium_simple_cache(
-    cache_dir: pathlib.Path,
-    output_dir: pathlib.Path,
-) -> tuple[set[str], dict[str, list[CachedAvatar]], dict[str, list[CachedAttachment]]]:
-    deduplicated_messages: set[str] = set()
-    avatars: dict[str, list[CachedAvatar]] = defaultdict(list)
-    attachments: dict[str, list[CachedAttachment]] = defaultdict(list)
-
-    with ChromiumSimpleFileCache(cache_dir) as cache:
-        for key in cache.cache_keys():
-            parsed_url = urllib.parse.urlparse(key)
-            metas = cache.get_metadata(key)
-            datas = cache.get_cachefile(key)
-
-            if parsed_url.path.endswith("/messages"):
-                for meta, data in zip(metas, datas):
-                    if not data:
-                        continue
-                    encoding = meta.get_attribute("content-encoding")[0] if meta and meta.get_attribute("content-encoding") else ""
-                    inflated = inflate_bytes(data, encoding)
-                    payload = json.loads(inflated)
-                    if isinstance(payload, list):
-                        for message in payload:
-                            deduplicated_messages.add(json.dumps(message, sort_keys=True))
-                continue
-
-            if parsed_url.path.startswith("/avatars/") and "discord" in parsed_url.netloc:
-                parts = parsed_url.path.split("/")
-                if len(parts) < 4:
-                    continue
-                avatar_id = parts[2]
-                avatar_name = parts[3]
-                files: list[AttachmentFile] = []
-                for meta, data in zip(metas, datas):
-                    if not data:
-                        continue
-                    encoding = meta.get_attribute("content-encoding")[0] if meta and meta.get_attribute("content-encoding") else ""
-                    inflated = inflate_bytes(data, encoding)
-                    digest = hashlib.sha256(inflated).hexdigest()
-                    files.append(write_blob(output_dir, "avatars", digest, avatar_name, inflated))
-                if files:
-                    avatar_key = pathlib.Path(avatar_name).stem
-                    avatars[avatar_key].append(CachedAvatar(avatar_key, avatar_id, avatar_name, dedupe_files(files)))
-                continue
-
-            if parsed_url.path.startswith("/attachments/") and "discord" in parsed_url.netloc:
-                parts = parsed_url.path.split("/")
-                if len(parts) < 5:
-                    continue
-                channel_id = parts[2]
-                attachment_id = parts[3]
-                original_name = parts[4]
-                files = []
-                for meta, data in zip(metas, datas):
-                    if not data:
-                        continue
-                    encoding = meta.get_attribute("content-encoding")[0] if meta and meta.get_attribute("content-encoding") else ""
-                    inflated = inflate_bytes(data, encoding)
-                    digest = hashlib.sha256(inflated).hexdigest()
-                    files.append(write_blob(output_dir, "attachments", digest, original_name, inflated))
-                if files:
-                    attachments[attachment_id].append(
-                        CachedAttachment(attachment_id, channel_id, original_name, dedupe_files(files))
-                    )
-
-    return deduplicated_messages, avatars, attachments
 
 
 def process_okhttp_cache(
@@ -636,18 +266,16 @@ def process_okhttp_cache(
     return deduplicated_messages, avatars, attachments
 
 
-def process_blockfile_cache(
+def process_chromium_cache(
     cache_dir: pathlib.Path,
     output_dir: pathlib.Path,
+    cache_class: type[ChromiumCache],
 ) -> tuple[set[str], dict[str, list[CachedAvatar]], dict[str, list[CachedAttachment]]]:
     deduplicated_messages: set[str] = set()
     avatars: dict[str, list[CachedAvatar]] = defaultdict(list)
     attachments: dict[str, list[CachedAttachment]] = defaultdict(list)
-    cache_type = chromium_cache_class_guesser(cache_dir)
-    if cache_type is None:
-        raise ValueError(f"Could not detect Chromium cache type in {cache_dir}")
 
-    with cache_type(cache_dir) as cache:
+    with cache_class(cache_dir) as cache:
         for cache_key in cache.cache_keys():
             parsed_url = urllib.parse.urlparse(cache_key.url)
             metas = cache.get_metadata(cache_key)
@@ -1045,19 +673,15 @@ def write_json_report(
 
 
 def parse_cache(cache_dir: pathlib.Path, output_dir: pathlib.Path) -> str:
-    cache_type = detect_cache_type(cache_dir)
-    if cache_type == "okhttp":
+    if is_okhttp_cache(cache_dir):
+        cache_type = "okhttp"
         messages_json, avatars_by_key, attachments_by_id = process_okhttp_cache(cache_dir, output_dir)
-    elif cache_type == "chromium-simple":
-        messages_json, avatars_by_key, attachments_by_id = process_chromium_simple_cache(cache_dir, output_dir)
-    elif cache_type == "chromium-block":
-        if chromium_cache_class_guesser is None:
-            raise RuntimeError(
-                "Chromium blockfile cache detected. Install 'ccl_chromium_reader' to enable this format."
-            )
-        messages_json, avatars_by_key, attachments_by_id = process_blockfile_cache(cache_dir, output_dir)
     else:
-        raise RuntimeError(f"Unsupported or unknown cache format in: {cache_dir}")
+        cache_class = guess_cache_class(cache_dir)
+        if cache_class is None:
+            raise RuntimeError(f"Unsupported or unknown cache format in: {cache_dir}")
+        cache_type = _CACHE_TYPE_NAMES[cache_class]
+        messages_json, avatars_by_key, attachments_by_id = process_chromium_cache(cache_dir, output_dir, cache_class)
 
     channels = build_channels(messages_json, attachments_by_id)
     write_json_report(output_dir, cache_type, channels, avatars_by_key, attachments_by_id)

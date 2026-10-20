@@ -10,9 +10,8 @@ Standalone Discord cache parser that extracts:
 
 ## Supported cache formats
 
-- `OkHttp` caches used by Android-style clients
-- Chromium `simple` cache format used by modern Chromium-based desktop clients
-- Chromium `blockfile` caches when `ccl_chromium_reader` is installed separately
+- Chromium `simple` and `blockfile` caches (desktop clients), parsed via [`ccl_chromium_reader`](https://github.com/cclgroupltd/ccl_chromium_reader)'s `ccl_chromium_cache` module
+- `OkHttp` caches (Android clients), parsed by this tool directly since `ccl_chromium_cache` does not read that format
 
 ## Usage
 
@@ -31,5 +30,4 @@ py .\discord_cache_parser.py `
 
 ## Notes
 
-- `Brotli` is required for cache entries stored with `content-encoding: br`.
-- For Chromium blockfile caches, install `ccl_chromium_reader` from https://github.com/cclgroupltd/ccl_chromium_reader/ and rerun the parser.
+- Install dependencies with `pip install -r requirements.txt`. `ccl_chromium_reader` is required; `Brotli` is needed for entries stored with `content-encoding: br`.
