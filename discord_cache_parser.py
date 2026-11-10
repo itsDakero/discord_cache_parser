@@ -905,7 +905,7 @@ def render_links(file_refs: list[AttachmentFile]) -> str:
     return "<br>".join(links)
 
 
-def render_html_report(
+def render_evidence_report(
     output_dir: pathlib.Path,
     channels: dict[str, Channel],
     avatars_by_key: dict[str, list[CachedAvatar]],
@@ -1064,6 +1064,7 @@ def render_html_report(
 </head>
 <body>
   <h1>Discord Cache Parser Report</h1>
+  <p><a href="index.html">Open conversation view</a></p>
   <nav>
     <h2>Channels</h2>
     <ul>{''.join(channel_nav)}</ul>
@@ -1082,6 +1083,118 @@ def render_html_report(
 </body>
 </html>
 """
+    (output_dir / "evidence.html").write_text(report, encoding="utf-8")
+
+
+def local_file_url(file_ref: AttachmentFile) -> str:
+    # Only generated relative paths may become active links or media sources.
+    path = pathlib.PurePosixPath(file_ref.relative_path)
+    if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] not in {"avatars", "attachments"}:
+        return ""
+    return html.escape(urllib.parse.quote(path.as_posix(), safe="/"))
+
+
+def render_message_content(content: str, authors: dict[str, str]) -> str:
+    """A small, escaped subset of Discord formatting; never interpret cached HTML."""
+    pattern = re.compile(r"```[\s\S]*?```|`[^`\n]+`|<@!?\d+>|\*\*[^*\n]+\*\*|__[^_\n]+__|~~[^~\n]+~~|\*[^*\n]+\*")
+    parts = []
+    offset = 0
+    for match in pattern.finditer(content):
+        parts.append(html.escape(content[offset:match.start()]))
+        token = match.group()
+        if token.startswith("```"):
+            parts.append("<pre><code>" + html.escape(token[3:-3]) + "</code></pre>")
+        elif token.startswith("`"):
+            parts.append("<code>" + html.escape(token[1:-1]) + "</code>")
+        elif token.startswith("<@"):
+            user_id = token.strip("<@!>")
+            parts.append('<span class="mention">@' + html.escape(authors.get(user_id, user_id)) + "</span>")
+        else:
+            marker = token[:2] if token[:2] in {"**", "__", "~~"} else "*"
+            tag = {"**": "strong", "__": "u", "~~": "s", "*": "em"}[marker]
+            parts.append(f"<{tag}>" + html.escape(token[len(marker):-len(marker)]) + f"</{tag}>")
+        offset = match.end()
+    parts.append(html.escape(content[offset:]))
+    return "".join(parts)
+
+
+def report_time(value: str) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(dt.UTC) if parsed.tzinfo else parsed.replace(tzinfo=dt.UTC)
+    except ValueError:
+        return None
+
+
+def render_html_report(
+    output_dir: pathlib.Path,
+    channels: dict[str, Channel],
+    avatars_by_key: dict[str, list[CachedAvatar]],
+    attachments_by_id: dict[str, list[CachedAttachment]],
+) -> None:
+    render_evidence_report(output_dir, channels, avatars_by_key, attachments_by_id)
+    nav, sections = [], []
+    for index, channel in enumerate(sorted(channels.values(), key=lambda item: item.channel_id)):
+        # Internal numeric anchors keep arbitrary cached IDs out of selectors.
+        anchor = f"channel-{index}"
+        label = html.escape(channel.channel_id)
+        nav.append(f'<a href="#{anchor}"><span># {label}</span><small>{len(channel.messages)}</small></a>')
+        authors = {author.author_id: author.global_name or author.username for author in channel.authors}
+        messages = []
+        previous = None
+        previous_time = None
+        day = None
+        for message in channel.messages:
+            timestamp = report_time(message.timestamp)
+            current_day = timestamp.date() if timestamp else message.timestamp
+            if current_day != day:
+                day = current_day
+                date_label = timestamp.strftime("%d %B %Y") if timestamp else message.timestamp
+                messages.append(f'<div class="day"><span>{html.escape(date_label)}</span></div>')
+            grouped = bool(previous and timestamp and previous_time and
+                           previous.author == message.author and previous.msg_type in (0, 19) and
+                           message.msg_type in (0, 19) and timestamp.date() == previous_time.date() and
+                           0 <= (timestamp - previous_time).total_seconds() < 420)
+            name = html.escape(message.author.global_name or message.author.username)
+            clock = timestamp.strftime("%H:%M") if timestamp else message.timestamp
+            avatar_files = [file for avatar in avatars_by_key.get(message.author.avatar, []) for file in avatar.files]
+            avatar_url = next((local_file_url(file) for file in avatar_files
+                               if pathlib.Path(file.relative_path).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+                               and local_file_url(file)), "")
+            avatar = (f'<img class="avatar" src="{avatar_url}" alt="">' if avatar_url else
+                      f'<span class="avatar fallback" aria-hidden="true">{html.escape((message.author.global_name or message.author.username or "?")[:1])}</span>')
+            media = []
+            for attachment in message.attachments:
+                filename = html.escape(attachment.filename)
+                files = []
+                for file in attachment.cached_files:
+                    url = local_file_url(file)
+                    if not url:
+                        continue
+                    suffix = pathlib.Path(file.relative_path).suffix.lower()
+                    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+                        files.append(f'<a href="{url}"><img class="image" loading="lazy" src="{url}" alt="{filename}"></a>')
+                    files.append(f'<a class="file" href="{url}" download>{filename} · {file.size:,} bytes</a>')
+                media.append('<div class="attachment">' + ("".join(files) or f'<span class="missing">{filename} · not cached</span>') + '</div>')
+            edited = '<span class="edited"> (edited)</span>' if message.edited_timestamp else ""
+            system = message.msg_type not in (0, 19)
+            kind = f'<span class="system-type">{html.escape(get_msg_type(message.msg_type))}</span>' if system else ""
+            metadata = (f"Message ID: {message.msg_id}\nAuthor: {message.author.username} ({message.author.author_id})"
+                        f"\nTime: {message.timestamp}\nEdited: {message.edited_timestamp or 'No'}"
+                        f"\nType: {get_msg_type(message.msg_type)}")
+            details = f'<details class="metadata"><summary>Message details</summary><pre>{html.escape(metadata)}</pre></details>'
+            header = (f'<span class="compact-time" title="{html.escape(message.timestamp)}">{html.escape(clock)}</span>' if grouped else
+                      avatar + f'<header><strong>{name}</strong> <time title="{html.escape(message.timestamp)}">{html.escape(clock)} UTC</time></header>')
+            messages.append(f'<article class="message {"grouped" if grouped else ""} {"system" if system else ""}">'
+                            + header + '<div class="content">' + kind + render_message_content(message.content, authors)
+                            + edited + '</div>' + ''.join(media) + details + '</article>')
+            previous, previous_time = message, timestamp
+        sections.append(f'<section class="channel" id="{anchor}"><h2># {label}</h2>'
+                        '<p class="notice">Recovered cache · partial conversation · timestamps in UTC</p>'
+                        + ''.join(messages) + '</section>')
+    template = pathlib.Path(__file__).with_name("report.html").read_text(encoding="utf-8")
+    report = template.replace("<!-- CHANNEL_NAV -->", "".join(nav))
+    report = report.replace("<!-- CHANNELS -->", "".join(sections) or '<p class="notice">No messages recovered. See the evidence view for additional cached files.</p>')
     (output_dir / "index.html").write_text(report, encoding="utf-8")
 
 
