@@ -1094,13 +1094,13 @@ def local_file_url(file_ref: AttachmentFile) -> str:
     return html.escape(urllib.parse.quote(path.as_posix(), safe="/"))
 
 
-def render_message_content(content: str, authors: dict[str, str]) -> str:
+def render_message_content(content: str, authors: dict[str, str], *, nested: bool = True) -> str:
     """A small, escaped subset of Discord formatting; never interpret cached HTML."""
-    pattern = re.compile(
-        r"```[\s\S]*?```|`[^`\n]+`|<@!?\d+>|"
-        r"\*\*[^\n]+?\*\*(?!\*)|__[^_\n]+__|~~[^~\n]+~~|"
-        r"\*(?=\S)[^*\n]+(?<=\S)\*"
-    )
+    tokens = r"```[\s\S]*?```|`[^`\n]+`|<@!?\d+>|"
+    # A bold span gets one inner pass for italics, code and mentions, never more bold.
+    if nested:
+        tokens += r"\*\*[^\n]+?\*\*(?!\*)|__[^_\n]+__|~~[^~\n]+~~|"
+    pattern = re.compile(tokens + r"\*(?=\S)[^*\n]+(?<=\S)\*")
     parts = []
     offset = 0
     for match in pattern.finditer(content):
@@ -1121,7 +1121,8 @@ def render_message_content(content: str, authors: dict[str, str]) -> str:
             marker = token[:2] if token[:2] in {"**", "__", "~~"} else "*"
             tag = {"**": "strong", "__": "u", "~~": "s", "*": "em"}[marker]
             inner = token[len(marker):-len(marker)]
-            rendered = render_message_content(inner, authors) if marker == "**" else html.escape(inner)
+            rendered = (render_message_content(inner, authors, nested=False)
+                        if marker == "**" and nested else html.escape(inner))
             parts.append(f"<{tag}>" + rendered + f"</{tag}>")
         offset = match.end()
     parts.append(html.escape(content[offset:]))

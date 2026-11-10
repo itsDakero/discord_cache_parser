@@ -76,6 +76,19 @@ class ReportTests(unittest.TestCase):
             "<strong>bold <em>it</em> x</strong>",
         )
 
+    def test_triple_asterisks_keep_bold_italics(self):
+        self.assertEqual(
+            parser.render_message_content("***x***", {}),
+            "<strong><em>x</em></strong>",
+        )
+
+    def test_repeated_asterisks_do_not_exhaust_recursion(self):
+        for content in ["*" * 3999 + "x", "**" * 2000 + "x", "**a" * 1333]:
+            with self.subTest(length=len(content), ending=content[-3:]):
+                rendered = parser.render_message_content(content, {})
+                self.assertIsInstance(rendered, str)
+                self.assertIn(content[-1], rendered)
+
     def test_italics_require_non_whitespace_boundaries(self):
         for content in ["2 * 3 * 4", "* a*", "*a *"]:
             with self.subTest(content=content):
