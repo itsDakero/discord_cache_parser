@@ -64,3 +64,7 @@ Run the synthetic report tests (no evidence or real cache required):
 ```sh
 python3 -m unittest discover -s forensics/discord-cache-parser/tests -v
 ```
+
+## License
+
+MIT, see `LICENSE`.
