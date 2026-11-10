@@ -70,6 +70,41 @@ class ReportTests(unittest.TestCase):
         self.assertIn("missing.png · not cached", chat)
         self.assertNotIn("https://example.invalid", chat)
 
+    def test_bold_can_contain_italics(self):
+        self.assertEqual(
+            parser.render_message_content("**bold *it* x**", {}),
+            "<strong>bold <em>it</em> x</strong>",
+        )
+
+    def test_italics_require_non_whitespace_boundaries(self):
+        for content in ["2 * 3 * 4", "* a*", "*a *"]:
+            with self.subTest(content=content):
+                self.assertEqual(parser.render_message_content(content, {}), content)
+        self.assertEqual(parser.render_message_content("*a*", {}), "<em>a</em>")
+
+    def test_fenced_code_language_tag(self):
+        self.assertEqual(
+            parser.render_message_content("```py\nprint(1)```", {}),
+            "<pre><code>print(1)</code></pre>",
+        )
+        self.assertEqual(
+            parser.render_message_content("```print(1)```", {}),
+            "<pre><code>print(1)</code></pre>",
+        )
+
+    def test_nested_formatting_and_fenced_code_escape_html(self):
+        for content in [
+            "**bold *<script>alert(1)</script>* <img src=x>**",
+            "```py\n<script>alert(1)</script><img src=x>```",
+        ]:
+            with self.subTest(content=content):
+                rendered = parser.render_message_content(content, {})
+                tags = [tag for tag, _ in Elements(rendered).elements]
+                self.assertNotIn("script", tags)
+                self.assertNotIn("img", tags)
+                self.assertIn("&lt;script&gt;", rendered)
+                self.assertIn("&lt;img src=x&gt;", rendered)
+
     def test_code_escaping_and_path_validation(self):
         content = parser.render_message_content('`<img src=x>` ```<script>```', {})
         self.assertNotIn("<img", content)
